@@ -1,8 +1,8 @@
 # -------------------------------------------------------------
 #  📊 DASHBOARD FINANCIERO AVANZADO
 #      • ROIC y WACC (Kd y tasa efectiva por empresa)
-#      • Resumen agrupado y ORDENADO automáticamente por Sector
-#      • Secciones: valoración, rentabilidad, deuda, crecimiento, análisis
+#      • Resumen ordenado por Sector
+#      • Gráficos separados por Sector con controles
 # -------------------------------------------------------------
 import streamlit as st
 import pandas as pd
@@ -27,7 +27,7 @@ Rf  = 0.0435   # riesgo libre
 Rm  = 0.085    # retorno mercado
 Tc0 = 0.21     # tasa impositiva por defecto
 
-# Mapa de orden de sectores (puedes reordenar a gusto)
+# Orden deseado de sectores
 SECTOR_RANK = {
     "Consumer Defensive": 1,
     "Consumer Cyclical": 2,
@@ -40,7 +40,7 @@ SECTOR_RANK = {
     "Real Estate": 9,
     "Utilities": 10,
     "Basic Materials": 11,
-    "Unknown": 99,   # fallback
+    "Unknown": 99,
 }
 
 # =============================================================
@@ -59,21 +59,32 @@ def seek_row(df, keys):
             return df.loc[k]
     return pd.Series([0], index=df.columns[:1])
 
-def calc_ke(beta):               # costo del equity (CAPM)
+def calc_ke(beta):
     return Rf + beta * (Rm - Rf)
 
-def calc_kd(interest, debt):     # costo de la deuda
+def calc_kd(interest, debt):
     return interest / debt if debt else 0
 
-def calc_wacc(mcap, debt, ke, kd, t):  # WACC empresa-específico
+def calc_wacc(mcap, debt, ke, kd, t):
     total = mcap + debt
     return (mcap/total)*ke + (debt/total)*kd*(1-t) if total else None
 
-def cagr4(fin, metric):          # CAGR 3-4 años
+def cagr4(fin, metric):
     if metric not in fin.index:
         return None
     v = fin.loc[metric].dropna().iloc[:4]
     return (v.iloc[0]/v.iloc[-1])**(1/(len(v)-1))-1 if len(v)>1 and v.iloc[-1] else None
+
+def pct(series):
+    return pd.to_numeric(series, errors="coerce") * 100
+
+def num(series):
+    return pd.to_numeric(series, errors="coerce")
+
+def sector_sorted_df(df):
+    df["Sector"] = df["Sector"].fillna("Unknown")
+    df["SectorRank"] = df["Sector"].map(SECTOR_RANK).fillna(999).astype(int)
+    return df.sort_values(["SectorRank", "Sector", "Ticker"]).reset_index(drop=True)
 
 # =============================================================
 # 2. OBTENER DATOS POR EMPRESA
@@ -87,23 +98,19 @@ def obtener_datos_financieros(tk, Tc_def):
     if not info or bs.empty:
         raise ValueError("Sin datos de balance/info")
 
-    # --- Capital y resultados ---
     beta  = info.get("beta", 1)
     ke    = calc_ke(beta)
 
-    debt  = safe_first(seek_row(bs, ["Total Debt", "Long Term Debt"])) \
-            or info.get("totalDebt", 0)
+    debt  = safe_first(seek_row(bs, ["Total Debt", "Long Term Debt"])) or info.get("totalDebt", 0)
     cash  = safe_first(seek_row(bs, ["Cash And Cash Equivalents",
                                      "Cash And Cash Equivalents At Carrying Value",
                                      "Cash Cash Equivalents And Short Term Investments"]))
-    equity= safe_first(seek_row(bs, ["Common Stock Equity",
-                                     "Total Stockholder Equity"]))
+    equity= safe_first(seek_row(bs, ["Common Stock Equity","Total Stockholder Equity"]))
 
     interest = safe_first(seek_row(fin, ["Interest Expense"]))
     ebt      = safe_first(seek_row(fin, ["Ebt", "EBT"]))
     tax_exp  = safe_first(seek_row(fin, ["Income Tax Expense"]))
-    ebit     = safe_first(seek_row(fin, ["EBIT", "Operating Income",
-                                         "Earnings Before Interest and Taxes"]))
+    ebit     = safe_first(seek_row(fin, ["EBIT", "Operating Income","Earnings Before Interest and Taxes"]))
 
     kd   = calc_kd(interest, debt)
     tax  = tax_exp / ebt if ebt else Tc_def
@@ -123,6 +130,7 @@ def obtener_datos_financieros(tk, Tc_def):
     return {
         "Ticker": tk,
         "Sector": info.get("sector", "Unknown"),
+        "MarketCap": mcap,
         "Precio": price,
         "P/E": info.get("trailingPE"),
         "P/B": info.get("priceToBook"),
@@ -155,13 +163,17 @@ def main():
     with st.sidebar:
         st.header("⚙️ Configuración")
         t_in = st.text_area("Tickers (coma)",
-                            "HRL, AAPL, MSFT, ABT, O, XOM, KO, JNJ")
-        max_t = st.slider("Máx tickers", 1, 100, 25)
+                            "HRL, AAPL, MSFT, ABT, O, XOM, KO, JNJ, CLX, CHD, DDOG, CB")
+        max_t = st.slider("Máx tickers", 1, 100, 30)
         st.markdown("---")
         global Rf, Rm, Tc0
         Rf  = st.number_input("Risk-free (%)", 0.0, 20.0, 4.35)/100
         Rm  = st.number_input("Market return (%)", 0.0, 30.0, 8.5)/100
         Tc0 = st.number_input("Tax rate default (%)", 0.0, 50.0, 21.0)/100
+        st.markdown("---")
+        top_n = st.slider("Top N por sector (por market cap)", 1, 50, 25)
+        min_emp = st.number_input("Mín. empresas/sector para graficar", 1, 50, 1)
+        ylim_abs = st.slider("Límite eje Y para % (valor absoluto)", 10, 200, 100)
 
     tickers = [t.strip().upper() for t in t_in.split(",") if t.strip()][:max_t]
 
@@ -186,19 +198,16 @@ def main():
             if errs: st.table(pd.DataFrame(errs))
             return
 
-        df = pd.DataFrame(datos)
+        df = sector_sorted_df(pd.DataFrame(datos))
 
-        # --------- ORDENAR POR SECTOR (agrupa sí o sí) ----------
-        df["Sector"] = df["Sector"].fillna("Unknown")
-        # Crear clave numérica de orden (si el sector no está en el mapa -> 999)
-        df["SectorRank"] = df["Sector"].map(SECTOR_RANK).fillna(999).astype(int)
-        df = df.sort_values(["SectorRank", "Sector", "Ticker"]).reset_index(drop=True)
+        # Copias: una numérica para graficar (df_plot) y otra formateada (df_disp)
+        df_plot = df.copy()
+        df_disp = df.copy()
 
-        # --------- Formateo porcentual para mostrar ----------
-        pct_cols = ["Dividend Yield %", "Payout Ratio", "ROA", "ROE",
-                    "Oper Margin", "Profit Margin", "WACC", "ROIC", "EVA"]
+        # Formateo % para mostrar
+        pct_cols = ["Dividend Yield %", "Payout Ratio", "ROA", "ROE", "Oper Margin", "Profit Margin", "WACC", "ROIC"]
         for col in pct_cols:
-            df[col] = df[col].apply(lambda x: f"{x*100:,.2f}%" if pd.notnull(x) else "N/D")
+            df_disp[col] = df_disp[col].apply(lambda x: f"{x*100:,.2f}%" if pd.notnull(x) else "N/D")
 
         # =====================================================
         # Sección 1: Resumen General
@@ -209,120 +218,146 @@ def main():
                         "Current Ratio", "Debt/Eq", "Oper Margin", "Profit Margin",
                         "WACC", "ROIC", "EVA"]
         st.dataframe(
-            df[resumen_cols].dropna(how='all', axis=1),
+            df_disp[resumen_cols].dropna(how='all', axis=1),
             use_container_width=True,
-            height=430
+            height=420
         )
 
         if errs:
             st.subheader("🚫 Tickers con error")
             st.table(pd.DataFrame(errs))
 
-        # =====================================================
-        # Sección 2: Análisis de Valoración
-        # =====================================================
-        st.header("💰 Análisis de Valoración")
-        col1, col2 = st.columns(2)
+        # Lista de sectores presentes (ya ordenados)
+        sectors = df_plot["Sector"].dropna().unique().tolist()
 
-        with col1:
-            st.subheader("Ratios de Valoración")
-            fig, ax = plt.subplots(figsize=(10, 4))
-            df_val = df[["Ticker", "P/E", "P/B", "P/FCF"]].set_index("Ticker").apply(pd.to_numeric, errors="coerce")
-            df_val.plot(kind="bar", ax=ax, rot=45)
-            ax.set_ylabel("Ratio")
-            st.pyplot(fig); plt.close()
-
-        with col2:
-            st.subheader("Dividend Yield (%)")
-            fig, ax = plt.subplots(figsize=(10, 4))
-            dy = df[["Ticker", "Dividend Yield %"]].replace("N/D", 0)
-            dy["Dividend Yield %"] = dy["Dividend Yield %"].astype(str).str.rstrip("%").astype(float)
-            dy.set_index("Ticker").plot(kind="bar", ax=ax, rot=45)
-            ax.set_ylabel("%")
-            st.pyplot(fig); plt.close()
+        # Helper para limitar por sector (Top N por MarketCap y mínimo de empresas)
+        def sector_slice(sec_df):
+            sec_df = sec_df.sort_values("MarketCap", ascending=False).head(top_n)
+            return sec_df if len(sec_df) >= min_emp else pd.DataFrame(columns=sec_df.columns)
 
         # =====================================================
-        # Sección 3: Rentabilidad y Eficiencia
+        # Sección 2: Análisis de Valoración (por sector)
         # =====================================================
-        st.header("📈 Rentabilidad y Eficiencia")
-        tabs = st.tabs(["ROE vs ROA", "Márgenes", "WACC vs ROIC"])
+        st.header("💰 Análisis de Valoración (por Sector)")
+        for s in sectors:
+            sec = sector_slice(df_plot[df_plot["Sector"] == s])
+            if sec.empty:
+                continue
+            with st.expander(f"Sector: {s}  •  {len(sec)} empresas", expanded=False):
+                c1, c2 = st.columns(2)
 
-        with tabs[0]:
-            fig, ax = plt.subplots(figsize=(10, 5))
-            rr = df[["Ticker", "ROE", "ROA"]].replace("N/D", 0)
-            rr["ROE"] = rr["ROE"].astype(str).str.rstrip("%").astype(float)
-            rr["ROA"] = rr["ROA"].astype(str).str.rstrip("%").astype(float)
-            rr.set_index("Ticker").plot(kind="bar", ax=ax, rot=45)
-            ax.set_ylabel("%")
-            st.pyplot(fig); plt.close()
+                with c1:
+                    st.caption("Ratios de Valoración (P/E, P/B, P/FCF)")
+                    fig, ax = plt.subplots(figsize=(10, 4))
+                    sec_val = sec[["Ticker", "P/E", "P/B", "P/FCF"]].set_index("Ticker").apply(pd.to_numeric, errors="coerce")
+                    sec_val.plot(kind="bar", ax=ax, rot=45)
+                    ax.set_ylabel("Ratio")
+                    st.pyplot(fig); plt.close()
 
-        with tabs[1]:
-            fig, ax = plt.subplots(figsize=(10, 5))
-            mm = df[["Ticker", "Oper Margin", "Profit Margin"]].replace("N/D", 0)
-            mm["Oper Margin"] = mm["Oper Margin"].astype(str).str.rstrip("%").astype(float)
-            mm["Profit Margin"] = mm["Profit Margin"].astype(str).str.rstrip("%").astype(float)
-            mm.set_index("Ticker").plot(kind="bar", ax=ax, rot=45)
-            ax.set_ylabel("%")
-            st.pyplot(fig); plt.close()
-
-        with tabs[2]:
-            fig, ax = plt.subplots(figsize=(10, 5))
-            for _, r in df.iterrows():
-                w = float(str(r["WACC"]).rstrip("%")) if r["WACC"] != "N/D" else None
-                rt = float(str(r["ROIC"]).rstrip("%")) if r["ROIC"] != "N/D" else None
-                if w is not None and rt is not None:
-                    col = "green" if rt > w else "red"
-                    ax.bar(r["Ticker"], rt, color=col, alpha=0.6, label="ROIC")
-                    ax.bar(r["Ticker"], w, color="gray", alpha=0.3, label="WACC")
-            ax.set_ylabel("%")
-            ax.set_title("Creación de Valor: ROIC vs WACC")
-            handles, labels = ax.get_legend_handles_labels()
-            by_label = dict(zip(labels, handles))
-            ax.legend(by_label.values(), by_label.keys())
-            st.pyplot(fig); plt.close()
+                with c2:
+                    st.caption("Dividend Yield (%)")
+                    fig, ax = plt.subplots(figsize=(10, 4))
+                    dy = pct(sec["Dividend Yield %"])
+                    pd.DataFrame({"Dividend Yield %": dy.values}, index=sec["Ticker"]).plot(kind="bar", ax=ax, rot=45)
+                    ax.set_ylabel("%"); ax.set_ylim(-ylim_abs, ylim_abs)
+                    st.pyplot(fig); plt.close()
 
         # =====================================================
-        # Sección 4: Deuda & Liquidez
+        # Sección 3: Rentabilidad y Eficiencia (por sector)
         # =====================================================
-        st.header("🏦 Estructura de Capital y Liquidez")
-        col3, col4 = st.columns(2)
+        st.header("📈 Rentabilidad y Eficiencia (por Sector)")
+        for s in sectors:
+            sec = sector_slice(df_plot[df_plot["Sector"] == s])
+            if sec.empty: continue
+            with st.expander(f"Sector: {s}  •  {len(sec)} empresas", expanded=False):
+                t1, t2, t3 = st.columns(3)
 
-        with col3:
-            st.subheader("Apalancamiento")
-            fig, ax = plt.subplots(figsize=(10, 5))
-            lev = df[["Ticker", "Debt/Eq", "LtDebt/Eq"]].set_index("Ticker").apply(pd.to_numeric, errors="coerce")
-            lev.plot(kind="bar", stacked=True, ax=ax, rot=45)
-            ax.axhline(1, color="red", linestyle="--")
-            ax.set_ylabel("Ratio")
-            st.pyplot(fig); plt.close()
+                with t1:
+                    st.caption("ROE vs ROA (%)")
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    rr = pd.DataFrame({
+                        "ROE": pct(sec["ROE"]).values,
+                        "ROA": pct(sec["ROA"]).values
+                    }, index=sec["Ticker"])
+                    rr.plot(kind="bar", ax=ax, rot=45)
+                    ax.set_ylabel("%"); ax.set_ylim(-ylim_abs, ylim_abs)
+                    st.pyplot(fig); plt.close()
 
-        with col4:
-            st.subheader("Liquidez")
-            fig, ax = plt.subplots(figsize=(10, 5))
-            liq = df[["Ticker", "Current Ratio", "Quick Ratio"]].set_index("Ticker").apply(pd.to_numeric, errors="coerce")
-            liq.plot(kind="bar", ax=ax, rot=45)
-            ax.axhline(1, color="green", linestyle="--")
-            ax.set_ylabel("Ratio")
-            st.pyplot(fig); plt.close()
+                with t2:
+                    st.caption("Márgenes (%)")
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    mm = pd.DataFrame({
+                        "Oper Margin": pct(sec["Oper Margin"]).values,
+                        "Profit Margin": pct(sec["Profit Margin"]).values
+                    }, index=sec["Ticker"])
+                    mm.plot(kind="bar", ax=ax, rot=45)
+                    ax.set_ylabel("%"); ax.set_ylim(-ylim_abs, ylim_abs)
+                    st.pyplot(fig); plt.close()
+
+                with t3:
+                    st.caption("ROIC vs WACC (%)")
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    rw = pd.DataFrame({
+                        "ROIC": pct(sec["ROIC"]).values,
+                        "WACC": pct(sec["WACC"]).values
+                    }, index=sec["Ticker"])
+                    rw.plot(kind="bar", ax=ax, rot=45)
+                    ax.set_ylabel("%"); ax.set_ylim(-ylim_abs, ylim_abs)
+                    st.pyplot(fig); plt.close()
 
         # =====================================================
-        # Sección 5: Crecimiento
+        # Sección 4: Estructura de Capital y Liquidez (por sector)
         # =====================================================
-        st.header("🚀 Crecimiento (CAGR 3-4 años)")
-        growth_cols = ["Revenue Growth", "EPS Growth", "FCF Growth"]
-        gdf = df[["Ticker"] + growth_cols].set_index("Ticker") * 100
-        fig, ax = plt.subplots(figsize=(12, 6))
-        gdf.plot(kind="bar", ax=ax, rot=45)
-        ax.axhline(0, color="black", linewidth=0.8)
-        ax.set_ylabel("%")
-        st.pyplot(fig); plt.close()
+        st.header("🏦 Estructura de Capital y Liquidez (por Sector)")
+        for s in sectors:
+            sec = sector_slice(df_plot[df_plot["Sector"] == s])
+            if sec.empty: continue
+            with st.expander(f"Sector: {s}  •  {len(sec)} empresas", expanded=False):
+                c3, c4 = st.columns(2)
+
+                with c3:
+                    st.caption("Apalancamiento")
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    lev = sec[["Ticker", "Debt/Eq", "LtDebt/Eq"]].set_index("Ticker").apply(pd.to_numeric, errors="coerce")
+                    lev.plot(kind="bar", stacked=True, ax=ax, rot=45)
+                    ax.axhline(1, color="red", linestyle="--")
+                    ax.set_ylabel("Ratio")
+                    st.pyplot(fig); plt.close()
+
+                with c4:
+                    st.caption("Liquidez")
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    liq = sec[["Ticker", "Current Ratio", "Quick Ratio"]].set_index("Ticker").apply(pd.to_numeric, errors="coerce")
+                    liq.plot(kind="bar", ax=ax, rot=45)
+                    ax.axhline(1, color="green", linestyle="--")
+                    ax.set_ylabel("Ratio")
+                    st.pyplot(fig); plt.close()
+
+        # =====================================================
+        # Sección 5: Crecimiento (por sector)
+        # =====================================================
+        st.header("🚀 Crecimiento (CAGR 3-4 años, por Sector)")
+        for s in sectors:
+            sec = sector_slice(df_plot[df_plot["Sector"] == s])
+            if sec.empty: continue
+            with st.expander(f"Sector: {s}  •  {len(sec)} empresas", expanded=False):
+                fig, ax = plt.subplots(figsize=(12, 6))
+                gdf = pd.DataFrame({
+                    "Revenue Growth": pct(sec["Revenue Growth"]).values,
+                    "EPS Growth": pct(sec["EPS Growth"]).values,
+                    "FCF Growth": pct(sec["FCF Growth"]).values
+                }, index=sec["Ticker"])
+                gdf.plot(kind="bar", ax=ax, rot=45)
+                ax.axhline(0, color="black", linewidth=0.8)
+                ax.set_ylabel("%"); ax.set_ylim(-ylim_abs, ylim_abs)
+                st.pyplot(fig); plt.close()
 
         # =====================================================
         # Sección 6: Análisis individual
         # =====================================================
         st.header("🔍 Análisis por Empresa")
-        pick = st.selectbox("Selecciona empresa", df["Ticker"].unique())
-        det = df[df["Ticker"] == pick].iloc[0]
+        pick = st.selectbox("Selecciona empresa", df_disp["Ticker"].unique())
+        det = df_disp[df_disp["Ticker"] == pick].iloc[0]
 
         cA, cB, cC = st.columns(3)
         with cA:
